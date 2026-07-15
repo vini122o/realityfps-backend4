@@ -81,6 +81,8 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
                 opt.setName('ativacoes').setDescription('Em quantas contas essa key pode ser usada (padrão: 1)').setMinValue(1).setRequired(false))
             .addIntegerOption((opt) =>
                 opt.setName('dias').setDescription('Expira em quantos dias (deixe vazio pra vitalícia)').setMinValue(1).setRequired(false))
+            .addIntegerOption((opt) =>
+                opt.setName('minutos').setDescription('Expira em quantos minutos (pra key de teste/curta duração, ex: 10)').setMinValue(1).setRequired(false))
             .addUserOption((opt) =>
                 opt.setName('comprador').setDescription('Se preenchido, o bot manda a key por DM e avisa antes de vencer').setRequired(false)),
         new SlashCommandBuilder()
@@ -91,6 +93,19 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
         new SlashCommandBuilder()
             .setName('estoque')
             .setDescription('Mostra estatísticas de vendas/licenças (restrito)'),
+        new SlashCommandBuilder()
+            .setName('listarkeys')
+            .setDescription('Lista as keys geradas, com filtro por status (restrito)')
+            .addStringOption((opt) =>
+                opt.setName('filtro')
+                    .setDescription('Quais keys mostrar (padrão: ativas)')
+                    .setRequired(false)
+                    .addChoices(
+                        { name: 'Ativas', value: 'ativas' },
+                        { name: 'Todas', value: 'todas' },
+                        { name: 'Expiradas', value: 'expiradas' },
+                        { name: 'Revogadas', value: 'revogadas' },
+                    )),
         new SlashCommandBuilder()
             .setName('verkey')
             .setDescription('Mostra detalhes de uma key: quem já ativou e o nick da conta no Minecraft (restrito)')
@@ -167,6 +182,9 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
             } else if (interaction.commandName === 'verkey') {
                 if (await denyIfNotAuthorized(interaction)) return;
                 await handleVerKey(interaction);
+            } else if (interaction.commandName === 'listarkeys') {
+                if (await denyIfNotAuthorized(interaction)) return;
+                await handleListarKeys(interaction);
             } else if (interaction.commandName === 'loja') {
                 await handleLoja(interaction); // público, sem checar permissão
             }
@@ -187,15 +205,19 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
         const nota = interaction.options.getString('nota') || `Discord: ${interaction.user.tag}`;
         const ativacoes = interaction.options.getInteger('ativacoes') || 1;
         const dias = interaction.options.getInteger('dias') || null;
+        const minutos = interaction.options.getInteger('minutos') || null;
         const comprador = interaction.options.getUser('comprador');
 
         const license = await createLicense({
             tier: 'pro',
             note: nota,
             maxActivations: ativacoes,
-            expiresInDays: dias,
+            expiresInDays: minutos ? null : dias, // minutos tem prioridade se os dois vierem preenchidos
+            expiresInMinutes: minutos,
             buyerDiscordId: comprador ? comprador.id : null,
         });
+
+        const validadeTexto = minutos ? `${minutos} minuto(s)` : (dias ? `${dias} dia(s)` : 'Vitalícia');
 
         const embed = new EmbedBuilder()
             .setColor(0x2ecc71)
@@ -203,7 +225,7 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
             .addFields(
                 { name: 'Key', value: `\`${license.key}\`` },
                 { name: 'Ativações', value: String(ativacoes), inline: true },
-                { name: 'Validade', value: dias ? `${dias} dia(s)` : 'Vitalícia', inline: true },
+                { name: 'Validade', value: validadeTexto, inline: true },
                 { name: 'Nota', value: nota },
             )
             .setFooter({ text: 'Comando no jogo: /realityfps license SUACHAVE' });
@@ -217,9 +239,11 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
                         `🎉 Sua key Pro do **RealityFPS** chegou!\n\n` +
                         `\`${license.key}\`\n\n` +
                         `No jogo, digite:\n\`/realityfps license ${license.key}\`` +
-                        (dias
-                            ? `\n\nVálida por ${dias} dia(s) a partir de agora. Eu aviso por aqui uns dias antes de vencer.`
-                            : '\n\nVitalícia.'),
+                        (minutos
+                            ? `\n\nVálida por ${minutos} minuto(s) a partir de agora.`
+                            : dias
+                                ? `\n\nVálida por ${dias} dia(s) a partir de agora. Eu aviso por aqui uns dias antes de vencer.`
+                                : '\n\nVitalícia.'),
                 });
                 await interaction.followUp({ content: `📨 Também mandei a key por DM pra ${comprador}.`, ephemeral: true });
             } catch (dmError) {
@@ -238,7 +262,7 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
                     content:
                         `🔑 **Nova key gerada** por ${interaction.user} \`${license.key}\` ` +
                         `${comprador ? 'pra ' + comprador : ''} — ${ativacoes} ativação(ões), ` +
-                        `${dias ? dias + ' dia(s)' : 'vitalícia'}. Nota: ${nota}`,
+                        `${validadeTexto}. Nota: ${nota}`,
                 });
             } catch (e) {
                 console.error('[discord-bot] Não consegui mandar no canal de log de vendas:', e.message);
@@ -334,6 +358,54 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
                 { name: 'Nota', value: lic.note || '—' },
                 { name: 'Contas que usaram', value: contasTexto },
             );
+        await interaction.editReply({ embeds: [embed] });
+    }
+
+    async function handleListarKeys(interaction) {
+        await interaction.deferReply({ ephemeral: true });
+        const filtro = interaction.options.getString('filtro') || 'ativas';
+
+        const all = await storeAll();
+        const now = Date.now();
+        let entries = Object.entries(all);
+
+        entries = entries.filter(([, lic]) => {
+            const expirada = lic.expiresAt && now > lic.expiresAt;
+            switch (filtro) {
+                case 'todas': return true;
+                case 'expiradas': return expirada && !lic.revoked;
+                case 'revogadas': return !!lic.revoked;
+                case 'ativas':
+                default: return !lic.revoked && !expirada;
+            }
+        });
+
+        // Mais recentes primeiro
+        entries.sort(([, a], [, b]) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        if (entries.length === 0) {
+            await interaction.editReply(`Nenhuma key encontrada com o filtro **${filtro}**.`);
+            return;
+        }
+
+        // Discord limita cada campo de embed a 1024 caracteres - mostra só as mais recentes
+        // que couberem, e avisa quantas ficaram de fora (pra consultar uma específica, use /verkey).
+        const LIMITE = 25;
+        const mostrar = entries.slice(0, LIMITE);
+        const linhas = mostrar.map(([key, lic]) => {
+            const status = lic.revoked ? '🚫' : (lic.expiresAt && now > lic.expiresAt ? '⌛' : '✅');
+            const usos = `${(lic.activatedUuids || []).length}/${lic.maxActivations}`;
+            return `${status} \`${key}\` — ${usos} — ${lic.note || 'sem nota'}`;
+        });
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle(`🔑 Keys (${filtro}) — ${entries.length} encontrada(s)`)
+            .setDescription(linhas.join('\n'))
+            .setFooter({ text: entries.length > LIMITE
+                    ? `Mostrando as ${LIMITE} mais recentes de ${entries.length}. Use /verkey pra detalhes de uma específica.`
+                    : 'Use /verkey key:... pra ver detalhes (quem ativou, nick, etc).' });
+
         await interaction.editReply({ embeds: [embed] });
     }
 
