@@ -92,6 +92,11 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
             .setName('estoque')
             .setDescription('Mostra estatísticas de vendas/licenças (restrito)'),
         new SlashCommandBuilder()
+            .setName('verkey')
+            .setDescription('Mostra detalhes de uma key: quem já ativou e o nick da conta no Minecraft (restrito)')
+            .addStringOption((opt) =>
+                opt.setName('key').setDescription('A key a consultar (ex: RFPS-AB3D-92XZ-77QK)').setRequired(true)),
+        new SlashCommandBuilder()
             .setName('loja')
             .setDescription('Mostra o catálogo de produtos do RealityFPS Pro'),
     ];
@@ -159,6 +164,9 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
             } else if (interaction.commandName === 'estoque') {
                 if (await denyIfNotAuthorized(interaction)) return;
                 await handleEstoque(interaction);
+            } else if (interaction.commandName === 'verkey') {
+                if (await denyIfNotAuthorized(interaction)) return;
+                await handleVerKey(interaction);
             } else if (interaction.commandName === 'loja') {
                 await handleLoja(interaction); // público, sem checar permissão
             }
@@ -273,6 +281,58 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
                 { name: 'Expiradas', value: String(stats.expired), inline: true },
                 { name: 'Revogadas', value: String(stats.revoked), inline: true },
                 { name: 'Ativações usadas', value: `${stats.activationsUsed} / ${stats.activationsTotal}`, inline: true },
+            );
+        await interaction.editReply({ embeds: [embed] });
+    }
+
+    /**
+     * Resolve um UUID de conta Minecraft pro nick atual, usando a API pública da Mojang.
+     * Retorna null se não conseguir (conta não-premium/offline, UUID inválido, API fora do
+     * ar, etc.) - nesses casos o comando mostra só o UUID mesmo, sem quebrar.
+     */
+    async function resolveMojangUsername(uuid) {
+        try {
+            const clean = uuid.replace(/-/g, '');
+            const resp = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${clean}`);
+            if (!resp.ok) {
+                return null;
+            }
+            const data = await resp.json();
+            return data && data.name ? data.name : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function handleVerKey(interaction) {
+        await interaction.deferReply({ ephemeral: true });
+        const key = interaction.options.getString('key').trim().toUpperCase();
+
+        const lic = await storeGet(key);
+        if (!lic) {
+            await interaction.editReply(`❌ Key \`${key}\` não encontrada.`);
+            return;
+        }
+
+        // Resolve o nick de cada conta que já ativou essa key. Faz em paralelo (Promise.all)
+        // pra não esperar uma chamada de cada vez - a API da Mojang é externa, então pode
+        // demorar um pouco dependendo de quantas contas ativaram.
+        const uuids = lic.activatedUuids || [];
+        const nomes = await Promise.all(uuids.map((u) => resolveMojangUsername(u)));
+        const contasTexto = uuids.length === 0
+            ? 'Nenhuma conta ativou ainda'
+            : uuids.map((u, i) => `• **${nomes[i] || '(nick não encontrado)'}** — \`${u}\``).join('\n');
+
+        const embed = new EmbedBuilder()
+            .setColor(lic.revoked ? 0xe74c3c : 0x3498db)
+            .setTitle(`🔑 Key ${key}`)
+            .addFields(
+                { name: 'Status', value: lic.revoked ? '🚫 Revogada' : (lic.expiresAt && Date.now() > lic.expiresAt ? '⌛ Expirada' : '✅ Ativa'), inline: true },
+                { name: 'Tier', value: lic.tier || 'pro', inline: true },
+                { name: 'Ativações', value: `${uuids.length} / ${lic.maxActivations}`, inline: true },
+                { name: 'Validade', value: lic.expiresAt ? new Date(lic.expiresAt).toLocaleString('pt-BR') : 'Vitalícia', inline: true },
+                { name: 'Nota', value: lic.note || '—' },
+                { name: 'Contas que usaram', value: contasTexto },
             );
         await interaction.editReply({ embeds: [embed] });
     }
