@@ -308,17 +308,26 @@ function generateKey() {
  * /license/generate e o bot do Discord (pra não duplicar código nem precisar
  * o bot chamar o próprio servidor via HTTP com o ADMIN_TOKEN exposto).
  */
-async function createLicense({ tier = 'pro', note = '', maxActivations = 1, expiresInDays = null, buyerDiscordId = null }) {
+async function createLicense({ tier = 'pro', note = '', maxActivations = 1, expiresInDays = null, expiresInMinutes = null, buyerDiscordId = null }) {
     let key;
     do {
         key = generateKey();
     } while (await storeGet(key)); // (nunca deve colidir, mas por garantia)
 
+    // Minutos tem prioridade sobre dias se os dois vierem preenchidos (não deveria
+    // acontecer normalmente, mas assim o comportamento fica previsível em vez de somar).
+    let expiresAt = null;
+    if (expiresInMinutes) {
+        expiresAt = Date.now() + expiresInMinutes * 60 * 1000;
+    } else if (expiresInDays) {
+        expiresAt = Date.now() + expiresInDays * 24 * 60 * 60 * 1000;
+    }
+
     const license = {
         tier,
         note,
         createdAt: Date.now(),
-        expiresAt: expiresInDays ? Date.now() + expiresInDays * 24 * 60 * 60 * 1000 : null,
+        expiresAt,
         maxActivations,
         activatedUuids: [],
         buyerDiscordId,
@@ -332,8 +341,8 @@ async function createLicense({ tier = 'pro', note = '', maxActivations = 1, expi
 // Gera uma nova key. Chame isso você mesmo (via curl/Postman) toda vez que vender uma key no Discord.
 app.post('/license/generate', requireAdmin, async (req, res) => {
     try {
-        const { tier = 'pro', note = '', maxActivations = 1, expiresInDays = null, buyerDiscordId = null } = req.body || {};
-        const result = await createLicense({ tier, note, maxActivations, expiresInDays, buyerDiscordId });
+        const { tier = 'pro', note = '', maxActivations = 1, expiresInDays = null, expiresInMinutes = null, buyerDiscordId = null } = req.body || {};
+        const result = await createLicense({ tier, note, maxActivations, expiresInDays, expiresInMinutes, buyerDiscordId });
         res.json(result);
     } catch (e) {
         console.error('Erro em /license/generate', e);
