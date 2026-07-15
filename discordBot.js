@@ -174,7 +174,7 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
     });
 
     async function handleGerarKey(interaction) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply(); // visível no canal e fica salvo no histórico
 
         const nota = interaction.options.getString('nota') || `Discord: ${interaction.user.tag}`;
         const ativacoes = interaction.options.getInteger('ativacoes') || 1;
