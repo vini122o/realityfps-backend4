@@ -223,6 +223,23 @@ async function storeAll() {
     return fileReadAllSync();
 }
 
+// ---------- Health / keep-alive ----------
+//
+// PRA QUE SERVE ISSO: no plano free do Render, o serviço "dorme" depois de ~15 minutos
+// sem receber NENHUMA requisição HTTP de fora. Quando isso acontece, o processo Node
+// inteiro para - e como o bot do Discord roda dentro desse MESMO processo, ele também
+// cai junto (é por isso que o bot "fica off toda hora": não é o bot que trava, é o
+// Render que desliga o servidor inteiro por inatividade).
+//
+// A solução é fazer alguma requisição externa bater nesse endpoint de tempos em tempos
+// (menos de 15 min), pra o Render sempre ver "tráfego recente" e nunca dormir. Um jeito
+// grátis: cria uma conta em https://uptimerobot.com, adiciona um monitor HTTP(s) apontando
+// pra "https://SEU-BACKEND.onrender.com/health" com intervalo de 5 minutos. Isso mantém o
+// servidor (e o bot) online 24/7 sem custar nada.
+app.get('/health', (req, res) => {
+    res.json({ ok: true, uptimeSeconds: Math.round(process.uptime()) });
+});
+
 // ---------- Badge (já existia) ----------
 
 const ONLINE_TIMEOUT_MS = 90 * 1000;
