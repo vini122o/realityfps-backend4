@@ -56,13 +56,101 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-app.use(express.json());
+// Limite de tamanho no body: evita que alguém mande um payload gigante só pra gastar
+// CPU/memória do processo (o mod nunca manda mais que uma keyzinha + um UUID).
+app.use(express.json({ limit: '10kb' }));
+// Necessário no Render/Railway/etc (o app fica atrás de um proxy reverso) pra req.ip
+// devolver o IP real do cliente em vez do IP interno do proxy - sem isso, o rate
+// limiter abaixo trataria TODO mundo como se fosse o mesmo IP.
+app.set('trust proxy', 1);
 
 // ---------- Config ----------
 
 // Defina isso como variável de ambiente no seu host (Render/Railway/etc).
 // Sem essa variável configurada, os endpoints admin ficam desligados por segurança.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+
+// Segredo usado pra ASSINAR (HMAC-SHA256) cada resposta de /license/validate, pra o mod
+// conseguir confirmar que a resposta veio mesmo deste backend (e não de um servidor falso
+// que o jogador apontou via config editado à mão). Tem que ser EXATAMENTE o mesmo valor
+// que está em SIGNING_SECRET no LicenseManager.java do mod - se um dos dois lados mudar
+// sem o outro, toda validação passa a falhar por assinatura inválida.
+const SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || 'TROQUE_ISTO_openssl_rand_hex_32_ANTES_DE_VENDER';
+if (SIGNING_SECRET === 'TROQUE_ISTO_openssl_rand_hex_32_ANTES_DE_VENDER') {
+    console.warn('[segurança] LICENSE_SIGNING_SECRET não configurado - usando o valor padrão do');
+    console.warn('[segurança] template, que é PÚBLICO (está no código-fonte). Gere um valor forte');
+    console.warn('[segurança] com `openssl rand -hex 32`, configure como variável de ambiente');
+    console.warn('[segurança] LICENSE_SIGNING_SECRET aqui, cole o MESMO valor em SIGNING_SECRET no');
+    console.warn('[segurança] LicenseManager.java do mod, e recompile o mod antes de vender de verdade.');
+}
+
+/** Assina os campos de uma resposta de validação. Formato tem que bater com o LicenseManager.java. */
+function signValidation(key, uuid, tier, timestampSeconds) {
+    return crypto.createHmac('sha256', SIGNING_SECRET)
+        .update(`${key}|${uuid}|${tier}|${timestampSeconds}`)
+        .digest('base64');
+}
+
+/** Comparação em tempo constante pra tokens/segredos - evita vazar por timing quantos bytes bateram. */
+function timingSafeStringEqual(a, b) {
+    const ba = Buffer.from(String(a ?? ''), 'utf8');
+    const bb = Buffer.from(String(b ?? ''), 'utf8');
+    if (ba.length !== bb.length) {
+        // ainda assim consome um tempo comparável, pra não vazar "tamanho errado" tão rápido
+        crypto.timingSafeEqual(ba, ba);
+        return false;
+    }
+    return crypto.timingSafeEqual(ba, bb);
+}
+
+// ---------- Rate limiting simples, em memória, sem dependência externa ----------
+//
+// Não precisa ser sofisticado: só existe pra impedir que alguém fique martelando
+// /license/validate (tentando adivinhar keys por força bruta) ou /heartbeat e /check
+// (spam) sem limite nenhum. Uma janela deslizante por IP é suficiente pro volume de
+// uma comunidade de Discord - não tente usar isso como proteção de DDoS de verdade
+// (pra isso, use algo na frente como Cloudflare).
+const rateBuckets = new Map(); // ip+route -> [timestamps]
+function rateLimit(routeName, maxRequests, windowMs) {
+    return (req, res, next) => {
+        const key = `${routeName}:${req.ip}`;
+        const now = Date.now();
+        const timestamps = (rateBuckets.get(key) || []).filter((t) => now - t < windowMs);
+        if (timestamps.length >= maxRequests) {
+            return res.status(429).json({ error: 'muitas requisições, tenta de novo daqui a pouco' });
+        }
+        timestamps.push(now);
+        rateBuckets.set(key, timestamps);
+        next();
+    };
+}
+// Limpeza periódica pra não vazar memória com IPs antigos
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, timestamps] of rateBuckets.entries()) {
+        const kept = timestamps.filter((t) => now - t < 10 * 60 * 1000);
+        if (kept.length === 0) rateBuckets.delete(key);
+        else rateBuckets.set(key, kept);
+    }
+}, 5 * 60 * 1000);
+
+// ---------- Trava por key (evita corrida de ativação) ----------
+//
+// BUG CORRIGIDO: antes, /license/validate fazia "lê a licença -> confere se ainda cabe
+// uma ativação -> grava de volta com o UUID novo" em passos separados (storeGet, depois
+// storeSet). Se duas requisições da MESMA key chegassem quase ao mesmo tempo (ex: dois
+// PCs diferentes usando a key vazada, ou só uma reconexão rápida), as duas podiam ler o
+// mesmo estado "ainda cabe 1 ativação" ANTES de qualquer uma escrever - e as duas
+// passavam, estourando o limite de ativações da key. Serializamos por key aqui.
+const keyLocks = new Map();
+function withKeyLock(key, fn) {
+    const prev = keyLocks.get(key) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    // Guarda a promise já "resolvida" (sem propagar erro pra próxima da fila) só pra
+    // encadear a ordem - o erro de verdade continua sendo devolvido pra quem chamou "run".
+    keyLocks.set(key, run.then(() => {}, () => {}));
+    return run;
+}
 
 const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 
@@ -244,32 +332,51 @@ app.get('/health', (req, res) => {
 
 const ONLINE_TIMEOUT_MS = 90 * 1000;
 const lastSeen = new Map();
-// FEATURE PRO: uuid -> último tier informado ("pro", "free", etc), pra exibir o selo pros outros
-const lastTier = new Map();
 
-app.post('/heartbeat', (req, res) => {
-    const { uuid, tier } = req.body || {};
+// BUG DE SEGURANÇA CORRIGIDO: antes, o selo "★ Pro" mostrado pros OUTROS jogadores vinha
+// de "lastTier", preenchido com o campo "tier" que o PRÓPRIO cliente manda no /heartbeat -
+// ou seja, o backend confiava cegamente na palavra do cliente sobre se ele é Pro ou não.
+// Qualquer client modificado (ou até um script simples imitando um heartbeat HTTP) podia
+// mandar tier: "pro" e exibir a estrela pra todo mundo sem nunca ter validado key nenhuma.
+// Isso não desbloqueava nada de verdade pra quem fez isso (as features Pro continuam
+// gated por LicenseManager.isPro(), que é validado à parte via /license/validate assinado),
+// mas ainda assim é uma mentira visual pros outros jogadores - o selo devia significar algo.
+// Agora o selo só é concedido a partir de uma validação de licença REAL e bem-sucedida
+// (a mesma chamada assinada que o LicenseManager.java faz), guardada aqui no servidor -
+// o corpo do /heartbeat não tem mais nenhuma influência sobre quem aparece como Pro.
+const PRO_BADGE_TTL_MS = 90 * 60 * 1000; // um pouco mais que o intervalo de revalidação (60min)
+const verifiedProUuids = new Map(); // uuid -> expiresAt (ms) de uma validação Pro recente e real
+
+app.post('/heartbeat', rateLimit('heartbeat', 20, 60 * 1000), (req, res) => {
+    const { uuid } = req.body || {};
     if (typeof uuid !== 'string' || uuid.length < 10) {
         return res.status(400).json({ error: 'uuid inválido' });
     }
     lastSeen.set(uuid, Date.now());
-    if (typeof tier === 'string') {
-        lastTier.set(uuid, tier);
-    }
+    // O campo "tier" que o mod manda aqui é só informativo pra debug - NÃO é mais usado
+    // pra decidir o selo Pro (ver comentário acima de verifiedProUuids).
     res.json({ ok: true });
 });
 
-app.post('/check', (req, res) => {
+app.post('/check', rateLimit('check', 30, 60 * 1000), (req, res) => {
     const { uuids } = req.body || {};
     if (!Array.isArray(uuids)) {
         return res.status(400).json({ error: 'uuids deve ser uma lista' });
+    }
+    // Limite de tamanho: sem isso, alguém podia mandar uma lista com milhares de UUIDs
+    // fabricados num único request e forçar o servidor a fazer um filter() gigante à toa.
+    if (uuids.length > 200) {
+        return res.status(400).json({ error: 'lista de uuids grande demais (máximo 200)' });
     }
     const now = Date.now();
     const online = uuids.filter((u) => {
         const t = lastSeen.get(u);
         return t !== undefined && (now - t) < ONLINE_TIMEOUT_MS;
     });
-    const proUuids = online.filter((u) => lastTier.get(u) && lastTier.get(u) !== 'free');
+    const proUuids = online.filter((u) => {
+        const expiresAt = verifiedProUuids.get(u);
+        return expiresAt !== undefined && expiresAt > now;
+    });
     res.json({ online, proUuids });
 });
 
@@ -278,7 +385,11 @@ setInterval(() => {
     for (const [uuid, t] of lastSeen.entries()) {
         if (now - t > ONLINE_TIMEOUT_MS) {
             lastSeen.delete(uuid);
-            lastTier.delete(uuid);
+        }
+    }
+    for (const [uuid, expiresAt] of verifiedProUuids.entries()) {
+        if (now > expiresAt) {
+            verifiedProUuids.delete(uuid);
         }
     }
 }, 60 * 1000);
@@ -289,7 +400,7 @@ function requireAdmin(req, res, next) {
     if (!ADMIN_TOKEN) {
         return res.status(503).json({ error: 'ADMIN_TOKEN não configurado no servidor' });
     }
-    if (req.headers['x-admin-token'] !== ADMIN_TOKEN) {
+    if (!timingSafeStringEqual(req.headers['x-admin-token'], ADMIN_TOKEN)) {
         return res.status(401).json({ error: 'não autorizado' });
     }
     next();
@@ -339,10 +450,30 @@ async function createLicense({ tier = 'pro', note = '', maxActivations = 1, expi
 }
 
 // Gera uma nova key. Chame isso você mesmo (via curl/Postman) toda vez que vender uma key no Discord.
-app.post('/license/generate', requireAdmin, async (req, res) => {
+app.post('/license/generate', rateLimit('admin', 60, 60 * 1000), requireAdmin, async (req, res) => {
     try {
         const { tier = 'pro', note = '', maxActivations = 1, expiresInDays = null, expiresInMinutes = null, buyerDiscordId = null } = req.body || {};
-        const result = await createLicense({ tier, note, maxActivations, expiresInDays, expiresInMinutes, buyerDiscordId });
+
+        // Validação básica de entrada - isso aqui só é chamado por você mesmo (protegido por
+        // ADMIN_TOKEN), mas validar mesmo assim evita gerar uma licença "quebrada" por engano
+        // (ex: maxActivations negativo, ou um número gigante digitado errado sem querer).
+        if (typeof tier !== 'string' || !tier.trim() || tier.length > 32) {
+            return res.status(400).json({ error: 'tier inválido' });
+        }
+        if (!Number.isInteger(maxActivations) || maxActivations < 1 || maxActivations > 1000) {
+            return res.status(400).json({ error: 'maxActivations deve ser um inteiro entre 1 e 1000' });
+        }
+        if (expiresInDays !== null && (!Number.isFinite(expiresInDays) || expiresInDays <= 0 || expiresInDays > 3650)) {
+            return res.status(400).json({ error: 'expiresInDays inválido' });
+        }
+        if (expiresInMinutes !== null && (!Number.isFinite(expiresInMinutes) || expiresInMinutes <= 0)) {
+            return res.status(400).json({ error: 'expiresInMinutes inválido' });
+        }
+        if (typeof note !== 'string' || note.length > 500) {
+            return res.status(400).json({ error: 'note inválida (máximo 500 caracteres)' });
+        }
+
+        const result = await createLicense({ tier: tier.trim(), note, maxActivations, expiresInDays, expiresInMinutes, buyerDiscordId });
         res.json(result);
     } catch (e) {
         console.error('Erro em /license/generate', e);
@@ -351,7 +482,7 @@ app.post('/license/generate', requireAdmin, async (req, res) => {
 });
 
 // Lista todas as keys (pra você administrar quem comprou o quê)
-app.get('/license/list', requireAdmin, async (req, res) => {
+app.get('/license/list', rateLimit('admin', 60, 60 * 1000), requireAdmin, async (req, res) => {
     try {
         res.json(await storeAll());
     } catch (e) {
@@ -362,7 +493,7 @@ app.get('/license/list', requireAdmin, async (req, res) => {
 
 // Revoga uma key (ex: chargeback, venda cancelada). Soft-revoke: fica marcada como
 // revogada (não valida mais) mas continua contando nas estatísticas de /license/stats.
-app.post('/license/revoke', requireAdmin, async (req, res) => {
+app.post('/license/revoke', rateLimit('admin', 60, 60 * 1000), requireAdmin, async (req, res) => {
     try {
         const { key } = req.body || {};
         if (!key) {
@@ -401,7 +532,7 @@ async function getLicenseStats() {
 }
 
 // "Estoque": estatísticas gerais das licenças, pra você acompanhar suas vendas.
-app.get('/license/stats', requireAdmin, async (req, res) => {
+app.get('/license/stats', rateLimit('admin', 60, 60 * 1000), requireAdmin, async (req, res) => {
     try {
         res.json(await getLicenseStats());
     } catch (e) {
@@ -411,7 +542,7 @@ app.get('/license/stats', requireAdmin, async (req, res) => {
 });
 
 // Endpoint que o MOD chama pra validar a key do jogador
-app.post('/license/validate', async (req, res) => {
+app.post('/license/validate', rateLimit('validate', 20, 60 * 1000), async (req, res) => {
     try {
         const { key, uuid } = req.body || {};
         if (typeof key !== 'string' || typeof uuid !== 'string' || !key.trim() || !uuid.trim()) {
@@ -427,29 +558,51 @@ app.post('/license/validate', async (req, res) => {
             return res.json({ valid: false, reason: 'uuid não identificado (conta inválida no cliente)' });
         }
 
-        const lic = await storeGet(key);
-        if (!lic) {
-            return res.json({ valid: false, reason: 'key não existe' });
-        }
+        const normalizedKey = normalizeKey(key);
 
-        if (lic.revoked) {
-            return res.json({ valid: false, reason: 'key revogada' });
-        }
-
-        if (lic.expiresAt && Date.now() > lic.expiresAt) {
-            return res.json({ valid: false, reason: 'key expirada' });
-        }
-
-        const alreadyActivated = lic.activatedUuids.includes(uuid);
-        if (!alreadyActivated) {
-            if (lic.activatedUuids.length >= lic.maxActivations) {
-                return res.json({ valid: false, reason: 'limite de ativações atingido pra essa key' });
+        // Lê + confere o limite de ativações + grava tudo dentro da mesma trava por key,
+        // pra duas requisições concorrentes com a mesma key não conseguirem "passar" juntas
+        // do limite de ativações (ver comentário na definição de withKeyLock acima).
+        const result = await withKeyLock(normalizedKey, async () => {
+            const lic = await storeGet(normalizedKey);
+            if (!lic) {
+                return { valid: false, reason: 'key não existe' };
             }
-            lic.activatedUuids = [...lic.activatedUuids, uuid];
-            await storeSet(key, lic);
+            if (lic.revoked) {
+                return { valid: false, reason: 'key revogada' };
+            }
+            if (lic.expiresAt && Date.now() > lic.expiresAt) {
+                return { valid: false, reason: 'key expirada' };
+            }
+
+            const alreadyActivated = lic.activatedUuids.includes(uuid);
+            if (!alreadyActivated) {
+                if (lic.activatedUuids.length >= lic.maxActivations) {
+                    return { valid: false, reason: 'limite de ativações atingido pra essa key' };
+                }
+                lic.activatedUuids = [...lic.activatedUuids, uuid];
+                await storeSet(normalizedKey, lic);
+            }
+            return { valid: true, tier: lic.tier };
+        });
+
+        if (!result.valid) {
+            return res.json(result);
         }
 
-        res.json({ valid: true, tier: lic.tier });
+        // Alimenta o selo "★ Pro" (badge) com uma validação REAL - ver comentário em
+        // verifiedProUuids, lá em cima na seção de badge. Só entra aqui quem passou pela
+        // validação de key de verdade (com todos os checks de revogação/expiração/limite
+        // de ativação acima), nunca a partir do que o cliente diz por conta própria.
+        if (result.tier && result.tier !== 'free') {
+            verifiedProUuids.set(uuid, Date.now() + PRO_BADGE_TTL_MS);
+        }
+
+        // Assina a resposta (HMAC-SHA256) com SIGNING_SECRET, pra o mod conseguir confirmar
+        // que essa resposta "valid: true" veio mesmo deste backend (ver LicenseManager.java).
+        const ts = Math.floor(Date.now() / 1000);
+        const sig = signValidation(normalizedKey, uuid, result.tier, ts);
+        res.json({ valid: true, tier: result.tier, ts, sig });
     } catch (e) {
         console.error('Erro em /license/validate', e);
         res.status(500).json({ valid: false, reason: 'erro interno do servidor' });
