@@ -52,7 +52,7 @@ function loadShopItems() {
 /**
  * Inicializa o bot. Recebe as funções do index.js (mesmo processo, sem HTTP interno).
  */
-function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses, markExpiryNotified, getLicenseStats }) {
+function initDiscordBot({ createLicense, storeAll, storeGet, storeSet, getExpiringLicenses, markExpiryNotified, getLicenseStats }) {
     const token = process.env.DISCORD_TOKEN;
     if (!token) {
         return; // bot desligado - nada a fazer
@@ -388,14 +388,17 @@ function initDiscordBot({ createLicense, storeGet, storeSet, getExpiringLicenses
             return;
         }
 
-        // Discord limita cada campo de embed a 1024 caracteres - mostra só as mais recentes
-        // que couberem, e avisa quantas ficaram de fora (pra consultar uma específica, use /verkey).
-        const LIMITE = 25;
+        // Discord limita a descrição do embed a 4096 caracteres - antes disso a mensagem
+        // inteira era rejeitada pela API sem aviso claro se alguma key tivesse uma nota
+        // longa (texto livre digitado no /gerarkey). Truncando cada nota e limitando a
+        // quantidade de linhas, garantimos que nunca estoura o limite.
+        const LIMITE = 20;
         const mostrar = entries.slice(0, LIMITE);
         const linhas = mostrar.map(([key, lic]) => {
             const status = lic.revoked ? '🚫' : (lic.expiresAt && now > lic.expiresAt ? '⌛' : '✅');
             const usos = `${(lic.activatedUuids || []).length}/${lic.maxActivations}`;
-            return `${status} \`${key}\` — ${usos} — ${lic.note || 'sem nota'}`;
+            const notaCurta = (lic.note || 'sem nota').slice(0, 40);
+            return `${status} \`${key}\` — ${usos} — ${notaCurta}`;
         });
 
         const embed = new EmbedBuilder()
@@ -456,4 +459,3 @@ async function checkExpiringLicenses(client, { getExpiringLicenses, markExpiryNo
 }
 
 module.exports = { initDiscordBot };
-
