@@ -59,6 +59,13 @@ const app = express();
 // Limite de tamanho no body: evita que alguém mande um payload gigante só pra gastar
 // CPU/memória do processo (o mod nunca manda mais que uma keyzinha + um UUID).
 app.use(express.json({ limit: '10kb' }));
+
+// Painel administrativo (gerar/listar/revogar keys, ver estatísticas) - arquivo estático
+// servido do próprio backend, mesma origem (sem precisar configurar CORS). Não tem
+// autenticação de servidor própria: quem abrir a página vê o formulário, mas toda ação de
+// verdade (gerar/listar/revogar) exige o mesmo x-admin-token que já protege esses endpoints
+// - digitado uma vez na página e guardado só no navegador de quem está usando.
+app.use('/admin', express.static(path.join(__dirname, 'admin')));
 // Necessário no Render/Railway/etc (o app fica atrás de um proxy reverso) pra req.ip
 // devolver o IP real do cliente em vez do IP interno do proxy - sem isso, o rate
 // limiter abaixo trataria TODO mundo como se fosse o mesmo IP.
@@ -70,24 +77,74 @@ app.set('trust proxy', 1);
 // Sem essa variável configurada, os endpoints admin ficam desligados por segurança.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// Segredo usado pra ASSINAR (HMAC-SHA256) cada resposta de /license/validate, pra o mod
-// conseguir confirmar que a resposta veio mesmo deste backend (e não de um servidor falso
-// que o jogador apontou via config editado à mão). Tem que ser EXATAMENTE o mesmo valor
-// que está em SIGNING_SECRET no LicenseManager.java do mod - se um dos dois lados mudar
-// sem o outro, toda validação passa a falhar por assinatura inválida.
-const SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || 'TROQUE_ISTO_openssl_rand_hex_32_ANTES_DE_VENDER';
-if (SIGNING_SECRET === 'TROQUE_ISTO_openssl_rand_hex_32_ANTES_DE_VENDER') {
-    console.warn('[segurança] LICENSE_SIGNING_SECRET não configurado - usando o valor padrão do');
-    console.warn('[segurança] template, que é PÚBLICO (está no código-fonte). Gere um valor forte');
-    console.warn('[segurança] com `openssl rand -hex 32`, configure como variável de ambiente');
-    console.warn('[segurança] LICENSE_SIGNING_SECRET aqui, cole o MESMO valor em SIGNING_SECRET no');
-    console.warn('[segurança] LicenseManager.java do mod, e recompile o mod antes de vender de verdade.');
+// Segredo MESTRE usado pra DERIVAR (não usar direto) um segredo específico por versão do
+// Minecraft (ver deriveVersionSecret abaixo). Isso NÃO é o mesmo valor que fica embutido em
+// cada LicenseManager.java - cada versão do mod embute só o segredo JÁ DERIVADO pra ela (ver
+// tools/derive_version_secret.py). É assim que uma cópia do LicenseManager.class crackeado
+// de uma versão não funciona colada em outra (o segredo embutido nela não bate com o que o
+// backend deriva pra versão real que está rodando).
+const DEFAULT_SECRET_PLACEHOLDER = 'TROQUE_ISTO_openssl_rand_hex_32_ANTES_DE_VENDER';
+const SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || DEFAULT_SECRET_PLACEHOLDER;
+// FALHA FECHADA (em vez de só avisar): se ninguém configurou LICENSE_SIGNING_SECRET,
+// esse valor placeholder está público neste arquivo-fonte - ou seja, QUALQUER PESSOA
+// com acesso a este repositório (ou que veja esse arquivo em algum vazamento/print)
+// consegue assinar respostas falsas de "licença válida" sozinha, sem nunca precisar
+// decompilar nada. Antes, isso só gerava um aviso no console e o servidor continuava
+// no ar assinando com esse valor público - fácil de passar despercebido num deploy
+// apressado. Agora o processo nem sobe: é melhor a loja parar (erro óbvio, fácil de
+// notar e corrigir) do que vender licenças "seguras" que na verdade não protegem nada.
+if (SIGNING_SECRET === DEFAULT_SECRET_PLACEHOLDER) {
+    console.error('[segurança] LICENSE_SIGNING_SECRET (segredo MESTRE) não configurado - o valor');
+    console.error('[segurança] padrão do template é PÚBLICO (está no código-fonte) e não protege');
+    console.error('[segurança] nada. Gere um valor forte com `openssl rand -hex 32`, configure como');
+    console.error('[segurança] variável de ambiente LICENSE_SIGNING_SECRET aqui, e pra CADA versão');
+    console.error('[segurança] do mod: rode tools/derive_version_secret.py <master> <versão MC> pra');
+    console.error('[segurança] gerar o segredo daquela versão, depois tools/encode_signing_secret.py');
+    console.error('[segurança] no resultado e cole em LicenseManager.java só daquela versão.');
+    console.error('[segurança] Recusando iniciar o servidor até o segredo mestre ser corrigido.');
+    process.exit(1);
 }
 
+/**
+ * Deriva um segredo ESPECÍFICO pra uma versão do Minecraft, a partir do segredo mestre.
+ * Isso é o que impede "crackou o LicenseManager.class de 1 versão, copiou pras outras 6" -
+ * ver comentário de segurança no topo de LicenseManager.java. Cada build do mod embute só
+ * o segredo derivado da SUA própria versão (gerado offline com
+ * tools/derive_version_secret.py), nunca o segredo mestre em si.
+ */
+function deriveVersionSecret(masterSecret, mcVersion) {
+    return crypto.createHmac('sha256', masterSecret).update(mcVersion).digest('hex');
+}
+
+// Formato aceito pra mcVersion: só dígitos/pontos/hífen/letras curtas (ex: "1.21.4",
+// "1.21.4-snapshot"). Não precisa bater com uma lista fixa de versões conhecidas (permite
+// lançar o mod pra uma versão nova sem mexer no backend) - só evita valores absurdos sendo
+// usados como entrada do HMAC.
+const MC_VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z.\-]{0,31}$/;
+
 /** Assina os campos de uma resposta de validação. Formato tem que bater com o LicenseManager.java. */
-function signValidation(key, uuid, tier, timestampSeconds) {
-    return crypto.createHmac('sha256', SIGNING_SECRET)
+function signValidation(signingKey, key, uuid, tier, timestampSeconds) {
+    return crypto.createHmac('sha256', signingKey)
         .update(`${key}|${uuid}|${tier}|${timestampSeconds}`)
+        .digest('base64');
+}
+
+// ---------- Parâmetros de tuning do tier Pro ----------
+//
+// Antes, os números que definem a vantagem do Pro (quantos níveis de otimização a mais,
+// quantos segundos mais rápido pra restaurar o render distance) ficavam como constante fixa
+// dentro do .jar (PerformanceManager.java / ChunkRenderOptimizer.java). Isso significa que
+// qualquer um abrindo o .jar num decompilador lia "PRO_MAX_LEVEL = 60" direto, sem precisar
+// nem entender a lógica nem burlar a licença - só ler um campo. Agora esses valores moram
+// só aqui, o mod pede pro backend e usa o que vier (assinado, ver signParams). Configuráveis
+// via env var pra você poder ajustar sem recompilar/redistribuir o mod.
+const PRO_MAX_LEVEL = parseInt(process.env.PRO_MAX_LEVEL || '60', 10);
+const SECONDS_TO_RESTORE_PRO = parseInt(process.env.SECONDS_TO_RESTORE_PRO || '1', 10);
+
+/** Assina (proMaxLevel, secondsToRestorePro) à parte da assinatura principal - formato tem que bater com LicenseManager.java. */
+function signParams(signingKey, key, uuid, tier, timestampSeconds, proMaxLevel, secondsToRestorePro) {
+    return crypto.createHmac('sha256', signingKey)
+        .update(`${key}|${uuid}|${tier}|${timestampSeconds}|${proMaxLevel}|${secondsToRestorePro}`)
         .digest('base64');
 }
 
@@ -131,6 +188,61 @@ setInterval(() => {
         const kept = timestamps.filter((t) => now - t < 10 * 60 * 1000);
         if (kept.length === 0) rateBuckets.delete(key);
         else rateBuckets.set(key, kept);
+    }
+}, 5 * 60 * 1000);
+
+// ---------- Trava por KEY contra força bruta distribuída entre vários IPs ----------
+//
+// O rateLimit acima é por IP: protege contra UM atacante martelando de UM lugar,
+// mas não contra alguém tentando adivinhar uma key específica (ou testando uma
+// lista de keys vazadas) usando muitos IPs diferentes (proxies, botnet, VPN
+// trocando toda hora) - cada IP individualmente fica bem abaixo do limite de 20/min,
+// mas a KEY em si está recebendo centenas de tentativas. Aqui contamos tentativas
+// FALHAS por key normalizada, não por IP, então não importa de onde elas vêm.
+const FAILED_ATTEMPTS_LIMIT = 8;
+const FAILED_ATTEMPTS_WINDOW_MS = 10 * 60 * 1000;
+const KEY_LOCKOUT_MS = 15 * 60 * 1000;
+const failedAttemptsByKey = new Map(); // normalizedKey -> [timestamps]
+const lockedKeysUntil = new Map();     // normalizedKey -> epoch ms até quando fica travada
+
+function isKeyLocked(normalizedKey) {
+    const until = lockedKeysUntil.get(normalizedKey);
+    if (!until) return false;
+    if (Date.now() >= until) {
+        lockedKeysUntil.delete(normalizedKey);
+        return false;
+    }
+    return true;
+}
+
+/** Chame isso sempre que uma validação de key falhar (key errada, revogada, etc). */
+function recordFailedAttempt(normalizedKey) {
+    const now = Date.now();
+    const attempts = (failedAttemptsByKey.get(normalizedKey) || []).filter(
+        (t) => now - t < FAILED_ATTEMPTS_WINDOW_MS
+    );
+    attempts.push(now);
+    failedAttemptsByKey.set(normalizedKey, attempts);
+    if (attempts.length >= FAILED_ATTEMPTS_LIMIT) {
+        lockedKeysUntil.set(normalizedKey, now + KEY_LOCKOUT_MS);
+    }
+}
+
+/** Chame isso quando uma validação passar - reseta o contador de falhas dessa key. */
+function clearFailedAttempts(normalizedKey) {
+    failedAttemptsByKey.delete(normalizedKey);
+}
+
+// Limpeza periódica (mesma ideia do rateBuckets acima)
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, timestamps] of failedAttemptsByKey.entries()) {
+        const kept = timestamps.filter((t) => now - t < FAILED_ATTEMPTS_WINDOW_MS);
+        if (kept.length === 0) failedAttemptsByKey.delete(key);
+        else failedAttemptsByKey.set(key, kept);
+    }
+    for (const [key, until] of lockedKeysUntil.entries()) {
+        if (now >= until) lockedKeysUntil.delete(key);
     }
 }, 5 * 60 * 1000);
 
@@ -544,10 +656,18 @@ app.get('/license/stats', rateLimit('admin', 60, 60 * 1000), requireAdmin, async
 // Endpoint que o MOD chama pra validar a key do jogador
 app.post('/license/validate', rateLimit('validate', 20, 60 * 1000), async (req, res) => {
     try {
-        const { key, uuid } = req.body || {};
+        const { key, uuid, mcVersion } = req.body || {};
         if (typeof key !== 'string' || typeof uuid !== 'string' || !key.trim() || !uuid.trim()) {
             return res.status(400).json({ valid: false, reason: 'key ou uuid ausente' });
         }
+        // mcVersion vem do FabricLoader do lado do cliente (não do nosso próprio bytecode) -
+        // ver comentário em LicenseManager.java sobre por que isso é a âncora anti-cópia entre
+        // versões. Sem ele, não tem como saber qual segredo derivado usar pra assinar a
+        // resposta, então trata como requisição malformada, igual key/uuid ausente.
+        if (typeof mcVersion !== 'string' || !MC_VERSION_PATTERN.test(mcVersion.trim())) {
+            return res.status(400).json({ valid: false, reason: 'mcVersion ausente ou inválido' });
+        }
+        const normalizedMcVersion = mcVersion.trim();
 
         // Nunca aceita uuid "unknown": se aceitássemos, todo jogador cujo cliente não
         // conseguiu resolver o UUID (ex: conta não-premium mal configurada) compartilharia
@@ -559,6 +679,14 @@ app.post('/license/validate', rateLimit('validate', 20, 60 * 1000), async (req, 
         }
 
         const normalizedKey = normalizeKey(key);
+
+        // Key travada por excesso de tentativas falhas recentes (ver seção "Trava por KEY"
+        // acima) - responde igual a uma key inválida comum, sem entrar em detalhe de "está
+        // travada por força bruta" (não queremos ensinar pra quem está testando keys que
+        // existe esse mecanismo, nem quando ele foi acionado).
+        if (isKeyLocked(normalizedKey)) {
+            return res.json({ valid: false, reason: 'key não existe' });
+        }
 
         // Lê + confere o limite de ativações + grava tudo dentro da mesma trava por key,
         // pra duas requisições concorrentes com a mesma key não conseguirem "passar" juntas
@@ -587,8 +715,10 @@ app.post('/license/validate', rateLimit('validate', 20, 60 * 1000), async (req, 
         });
 
         if (!result.valid) {
+            recordFailedAttempt(normalizedKey);
             return res.json(result);
         }
+        clearFailedAttempts(normalizedKey);
 
         // Alimenta o selo "★ Pro" (badge) com uma validação REAL - ver comentário em
         // verifiedProUuids, lá em cima na seção de badge. Só entra aqui quem passou pela
@@ -598,11 +728,22 @@ app.post('/license/validate', rateLimit('validate', 20, 60 * 1000), async (req, 
             verifiedProUuids.set(uuid, Date.now() + PRO_BADGE_TTL_MS);
         }
 
-        // Assina a resposta (HMAC-SHA256) com SIGNING_SECRET, pra o mod conseguir confirmar
-        // que essa resposta "valid: true" veio mesmo deste backend (ver LicenseManager.java).
+        // Assina a resposta (HMAC-SHA256) com o segredo DERIVADO pra essa versão do Minecraft
+        // (não o segredo mestre cru) - ver deriveVersionSecret e o comentário de segurança em
+        // LicenseManager.java sobre por que isso importa.
+        const versionSigningKey = deriveVersionSecret(SIGNING_SECRET, normalizedMcVersion);
         const ts = Math.floor(Date.now() / 1000);
-        const sig = signValidation(normalizedKey, uuid, result.tier, ts);
-        res.json({ valid: true, tier: result.tier, ts, sig });
+        const sig = signValidation(versionSigningKey, normalizedKey, uuid, result.tier, ts);
+
+        // Params de tuning só fazem sentido/são enviados pra tiers pagos - "free" não tem o que
+        // esconder aqui, então nem manda (o mod já usa os valores free locais nesse caso).
+        let params;
+        let psig;
+        if (result.tier !== 'free') {
+            params = { proMaxLevel: PRO_MAX_LEVEL, secondsToRestorePro: SECONDS_TO_RESTORE_PRO };
+            psig = signParams(versionSigningKey, normalizedKey, uuid, result.tier, ts, params.proMaxLevel, params.secondsToRestorePro);
+        }
+        res.json({ valid: true, tier: result.tier, ts, sig, params, psig });
     } catch (e) {
         console.error('Erro em /license/validate', e);
         res.status(500).json({ valid: false, reason: 'erro interno do servidor' });
